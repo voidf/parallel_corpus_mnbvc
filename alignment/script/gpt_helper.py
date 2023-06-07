@@ -1,5 +1,6 @@
 import datetime
 import os
+import sys # 调试用
 import time
 import json
 import traceback
@@ -39,7 +40,7 @@ def get_and_cache_dataset():
     except:
         dataset = datasets.load_dataset('bot-yaya/UN_PDF_SUBSET_PREPROCESSED', split='train')
         dataset.save_to_disk(my_path())
-    dataset = dataset.select(range(500)).filter(lambda x: x['record'] not in exception_files)
+    dataset = dataset.select(range(0, 50)).filter(lambda x: x['record'] not in exception_files) # 2950
     return dataset
 
 ## web
@@ -53,6 +54,20 @@ def use_proxy():
 def read_secret(key: str) -> str:
     v = os.environ[key] = os.environ.get(key) or input(f"Please input {key}:")    
     return v
+
+def generate_prompt2(input_content: str) -> list[dict[str, str]]:
+    return [
+        {'role': 'system', 'content': 'You are an experienced English editor. '},
+        {'role': 'user', 'content': '''I want you to check the following lines and group them into paragraphs. Please follow the instructions as below:
+
+- Remove all the unnecessary linebreaks and merge the hyphenated words. 
+- The original lines may be incomplete or mispelled, but DO NOT change any words of the original lines or add anything new. You must remember this.
+- Return the result in lines, so every paragraph is a line.
+- Return the lines only with nothing else. DO NOT explain anything.
+
+### Original Lines:
+''' + input_content},
+    ]
 
 def generate_prompt(input_content: str): 
     return [
@@ -87,8 +102,8 @@ def request_gpt_segment(prompt: str):
                 # "model": "text-davinci-003",
                 "model": "gpt-3.5-turbo",
                 # "model": "gpt-4",
-                "messages": generate_prompt(prompt),
-                # "temperature": 0, 
+                "messages": prompt,
+                "temperature": 0, 
                 # "max_tokens": 4000 - int(tokens * 1.3)
             },
             timeout= 60 * 5 # 我们顶多等5分钟
@@ -263,7 +278,11 @@ def ask_gpt_for_one_file(row: DatasetDict):
                             todo_lineid = len(input_lines)
                             break
 
-                        outputs = request_gpt_segment(batch)
+                        meta = {}
+                        outputs = request_gpt_segment(generate_prompt2(batch))
+                        # output_parsed = json.loads(re.search(r'(\{.*\})', outputs).group(1))
+                        # outputlines = output_parsed['paragraphs']
+                        # meta['score'] = output_parsed['score']
                         outputlines = clearup_output(outputs)
 
                         align_map, irate, orate = lcs_sequence_alignment(batch, outputlines)
@@ -297,7 +316,8 @@ def ask_gpt_for_one_file(row: DatasetDict):
                                 'input': batch, 
                                 'output': outputs,
                                 'offset': input_line_offset,
-                                'br': br
+                                'br': br,
+                                'meta': meta
                                 }, f)
                             f.write('\n')
 
@@ -310,7 +330,7 @@ def ask_gpt_for_one_file(row: DatasetDict):
                         with open(my_path('chatgptexception.jsonl'), 'a', encoding='utf-8') as f: # 日志
                             json.dump({'time': str(datetime.datetime.now()),'rec': rec, 'batch': batch_id, 'step': MAX_TOKEN_COUNT, 'input': batch, 'exc': 'unknown_response', 'msg': str(e.args)}, f)
                             f.write('\n')
-                    except requests.exceptions.ReadTimeout:
+                    except requests.exceptions.ReadTimeout as e:
                         with open(my_path('chatgptexception.jsonl'), 'a', encoding='utf-8') as f: # 日志
                             json.dump({'time': str(datetime.datetime.now()),'rec': rec, 'batch': batch_id, 'step': MAX_TOKEN_COUNT, 'input': batch, 'exc': 'timeout', 'msg': str(e.args)}, f)
                             f.write('\n')
@@ -330,8 +350,8 @@ def ask_gpt_for_one_file(row: DatasetDict):
 
                 print(f'sleep for {SLEEP_TIME}s')
                 time.sleep(SLEEP_TIME)
-
             batch_id += 1
+
     except Exception as e:
         with open(my_path('chatgptexception.jsonl'), 'a', encoding='utf-8') as f:
             json.dump({'time': str(datetime.datetime.now()),'rec': rec, 'exc': 'runtime_error', 'msg': traceback.format_exc()}, f)
@@ -509,13 +529,17 @@ def download_and_visualize():
     
 
 if __name__ == "__main__":
+    # if os.path.exists(my_path('chatgptexception.jsonl')):
+    #     with open(my_path('chatgptexception.jsonl'), 'r', encoding='utf-8') as f:
+    #         for line in f.read().splitlines():
+    #             json_log = json.loads(line)
+    #             if json_log.get('exc') == 'runtime_error':
+    #                 exception_files.add(json_log['rec'])
 
-    if os.path.exists(my_path('chatgptexception.jsonl')):
-        with open(my_path('chatgptexception.jsonl'), 'r', encoding='utf-8') as f:
+    if os.path.exists(my_path('exception_files.txt')):
+        with open(my_path('exception_files.txt'), 'r', encoding='utf-8') as f:
             for line in f.read().splitlines():
-                json_log = json.loads(line)
-                if json_log.get('exc') == 'runtime_error':
-                    exception_files.add(json_log['rec'])
+                exception_files.add(line)
 
     if exception_files:
         print('some files cannot be process properly in previous run:')
