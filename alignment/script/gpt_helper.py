@@ -5,7 +5,7 @@ import time
 import json
 import traceback
 import re
-from collections import OrderedDict
+from collections import OrderedDict, namedtuple
 from typing import Tuple
 from pathlib import Path
 from itertools import chain
@@ -131,77 +131,72 @@ def request_gpt_segment(prompt: str):
 def clearup_output(raw_output_from_chatgpt: str) -> list[str]:
     return list(filter(lambda x: len(x.strip()), raw_output_from_chatgpt.splitlines()))
 
-def lcs_sequence_alignment(ibatch: list[str] | str, obatch: list[str] | str) -> Tuple[dict[int, set[int]], list[float], list[float]]:
-    """将ibatch每行的单词用最长公共子序列对齐到obatch每行的单词中。
+LCSTokenInfo = namedtuple('LCSTokenInfo', ('token', 'length', 'source_line_id'))
+
+def tokenize_for_lcs(input_lines: list[str], output_lines: list[str], offset=0) -> Tuple[list[LCSTokenInfo], list[LCSTokenInfo]]:
+    word_dict = {}
+    input_tokens_info = []
+    output_tokens_info = []
+    for input_line_id, input_line in enumerate(input_lines):
+        for word in input_line.split():
+            input_tokens_info.append(LCSTokenInfo(
+                chr(offset + word_dict.setdefault(word, len(word_dict))),
+                len(word),
+                input_line_id,
+                ))
+    
+    for output_line_id, output_line in enumerate(output_lines):
+        for word in output_line.split():
+            if word in word_dict: # 为子序列写的优化
+                output_tokens_info.append(LCSTokenInfo(
+                    chr(offset + word_dict[word]),
+                    len(word),
+                    output_line_id,
+                    ))
+    return input_tokens_info, output_tokens_info
+
+
+def lcs_sequence_alignment(input_lines: list[str] | str, output_lines: list[str] | str) -> Tuple[dict[int, set[int]], list[float], list[float]]:
+    """将input_lines每行的单词用最长公共子序列对齐到output_lines每行的单词中。
     
     Args:
-        ibatch(str): 输入的一段话
-        obatch(str): chatgpt给对齐好的一段话
+        input_lines(str): 输入的一段话
+        output_lines(str): chatgpt给对齐好的一段话
     
     Returns:
         mapping(dict[int, set[int]]): 输出行号对应输入的行号
         irate(list[float]): 输入每行的匹配率（匹配的单词总长度/本行总单词总长度）
         orate(list[float]): 输出每行的匹配率
     """
-    if isinstance(ibatch, str):
-        ibatch = ibatch.splitlines()
-    if isinstance(obatch, str):
-        obatch = obatch.splitlines()
-    offset = 19968
-    dic = {}
+    if isinstance(input_lines, str):
+        input_lines = input_lines.splitlines()
+    if isinstance(output_lines, str):
+        output_lines = output_lines.splitlines()
     
-    ibuf = [] # 输入token
-    ilen = []
+    input_tokens_info, output_tokens_info = tokenize_for_lcs(input_lines, output_lines)
 
-    obuf = []
-    olen = []
-    # 手写的token转换，优化lcs的效率，这里换成中文字形式编码这些token，只判等
-    offset = 19968 # 中文unicode起点
-    dic = {}
-    for ilineid, iline in enumerate(ibatch):
-        sp = iline.split()
-        ilen.append(sum(map(len, sp)))
-        for i in sp:
-            ibuf.append((
-                chr(offset + dic.setdefault(i, len(dic))),
-                len(i),
-                ilineid,
-                ))
-    
-    for olineid, oline in enumerate(obatch):
-        sp = oline.split()
-        olen.append(sum(map(len, sp)))
-        for i in oline.split():
-            if i in dic: # 为子序列写的优化
-                obuf.append((
-                    chr(offset + dic[i]),
-                    len(i),
-                    olineid,
-                    ))
-    
+    irate = [0 for _ in input_lines]
+    orate = [0 for _ in output_lines]
 
-    irate = [0 for _ in ilen]
-    orate = [0 for _ in olen]
-
-    n1 = ''.join(map(lambda x: x[0], ibuf))
-    n2 = ''.join(map(lambda x: x[0], obuf))
-    print(f'n1:{len(n1)}, n2:{len(n2)}')
-    idxs = pylcs.lcs_sequence_idx(n1, n2)
+    input_tokens = ''.join(map(lambda x: x[0], input_tokens_info))
+    output_tokens = ''.join(map(lambda x: x[0], output_tokens_info))
+    print(f'input_tokens:{len(input_tokens)}, output_tokens:{len(output_tokens)}')
+    aligned_indexes = pylcs.lcs_sequence_idx(input_tokens, output_tokens)
     mapping = {}
-    for iidx, oidx in enumerate(idxs):
+    for iidx, oidx in enumerate(aligned_indexes):
         if oidx != -1:
-            _, iklen, ikgroup = ibuf[iidx]
-            _, oklen, okgroup = obuf[oidx]
+            _, iklen, ikgroup = input_tokens_info[iidx]
+            _, oklen, okgroup = output_tokens_info[oidx]
             mapping.setdefault(okgroup, set()).add(ikgroup)
             irate[ikgroup] += iklen
             orate[okgroup] += oklen
     
     for p, i in enumerate(irate):
-        irate[p] = i / ilen[p]
+        irate[p] /= sum(map(len, input_lines[p].split()))
     for p, i in enumerate(orate):
-        orate[p] = i / olen[p]
+        orate[p] /= sum(map(len, output_lines[p].split()))
 
-    # 额外处理：匹配率低于60%的olineid不要
+    # 额外处理：匹配率低于60%的output_line_id不要
     print(mapping)
     print('orate', orate)
     for p, i in enumerate(orate):
@@ -364,7 +359,7 @@ def post_process_for_one_file(row: DatasetDict):
     from loguru import logger
     logger.add(open('log.txt', 'a'))
     inputs = row['en'].replace('\ufffe', '-')
-    ilines = inputs.splitlines() # input lines
+    input_lines = inputs.splitlines() # input lines
     rec = row['record']
     output_file_name = my_path(f'done/gpt_en_{rec}.jsonl')
     if not os.path.exists(output_file_name):
@@ -384,11 +379,11 @@ def post_process_for_one_file(row: DatasetDict):
             obatches.append('==========')
 
     concated = []
-    for lineid, iline in enumerate(ilines):
+    for lineid, input_line in enumerate(input_lines):
         if lineid - 1 in soft_linebreak_indexes:
-            concated[-1] += ' ' + iline
+            concated[-1] += ' ' + input_line
         else:
-            concated.append(iline)
+            concated.append(input_line)
     Path(my_path('post')).mkdir(exist_ok=True)
     print(len(concated))
 
@@ -430,19 +425,19 @@ def convert_output_text_to_idx():
     
     for i in get_and_cache_dataset().filter(lambda x: x['record'] == record_id):
         pos = my_path('converted', f'{record_id}.idx')
-        ilines = i['en']
-        align_map, irate, orate = lcs_sequence_alignment(ilines, output)
+        input_lines = i['en']
+        align_map, irate, orate = lcs_sequence_alignment(input_lines, output)
         br = get_br_indexes_from_alignmap(align_map)
         with open(pos, 'w', encoding='utf-8') as f:
             f.write(','.join(map(str, br)))
 
         br = set(br) # br就是需要干掉的换行下标
         concated = []
-        for lineid, iline in enumerate(ilines.splitlines()):
+        for lineid, input_line in enumerate(input_lines.splitlines()):
             if lineid - 1 in br:
-                concated[-1] += ' ' + iline
+                concated[-1] += ' ' + input_line
             else:
-                concated.append(iline)
+                concated.append(input_line)
 
         with open(my_path('converted', f'{record_id}.txt'), 'w', encoding='utf-8') as f:
             f.write('\n'.join(concated))
