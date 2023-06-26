@@ -6,7 +6,7 @@ import time
 import json
 import traceback
 import re
-from collections import OrderedDict
+from collections import OrderedDict, namedtuple
 from typing import Tuple
 from pathlib import Path
 from itertools import chain
@@ -19,7 +19,7 @@ import datasets
 from datasets.dataset_dict import DatasetDict
 
 MAX_TOKEN_COUNT = 1400
-WORKDIR_ABSOLUTE = r'.' # 工作区绝对路径，为方便调试使用，实际使用换成.即可
+WORKDIR_ABSOLUTE = os.path.dirname(os.path.abspath(__file__)) # 工作区绝对路径，为方便调试使用，实际使用换成.即可
 RETRY_TIME = 5
 SLEEP_TIME = 0
 
@@ -123,85 +123,143 @@ def request_gpt_segment(prompt: str):
 def clearup_output(raw_output_from_chatgpt: str) -> list[str]:
     return list(filter(lambda x: len(x.strip()), raw_output_from_chatgpt.splitlines()))
 
-def lcs_sequence_alignment(ibatch: list[str] | str, obatch: list[str] | str, drop_th=0.6) -> Tuple[dict[int, set[int]], list[float], list[float]]:
-    """将ibatch每行的单词用最长公共子序列对齐到obatch每行的单词中。
+LCSTokenInfo = namedtuple('LCSTokenInfo', ('token', 'length', 'source_line_id'))
+def tokenize_by_space_splited_word(input_lines: list[str], output_lines: list[str], offset=0) -> Tuple[list[LCSTokenInfo], list[LCSTokenInfo]]:
+        """
+        Encode `input_lines` and `output_lines` by space splited word as utf-8 single character, to speedup LCS procedure.
+        
+        Args:
+            input_lines (list[str]): The list of lines from source text.
+            output_lines (list[str]): The list of lines from the processed text.
+            offset (int): utf-8 encoding begin offset for tokenizing.
+
+        Returns:
+            list[list[str]]: The batched lines.
+        """
+        word_dict = {}
+        input_tokens_info = []
+        output_tokens_info = []
+        for input_line_id, input_line in enumerate(input_lines):
+            for word in input_line.split():
+                input_tokens_info.append(LCSTokenInfo(
+                    chr(offset + word_dict.setdefault(word, len(word_dict))),
+                    len(word),
+                    input_line_id,
+                    ))
+        
+        for output_line_id, output_line in enumerate(output_lines):
+            for word in output_line.split():
+                if word in word_dict: # 为子序列写的优化
+                    output_tokens_info.append(LCSTokenInfo(
+                        chr(offset + word_dict[word]),
+                        len(word),
+                        output_line_id,
+                        ))
+        return input_tokens_info, output_tokens_info
+
+def tokenize_by_char(input_lines: list[str], output_lines: list[str], offset=0) -> Tuple[list[LCSTokenInfo], list[LCSTokenInfo]]:
+        """
+        """
+        char_set = set(chain(*input_lines))
+        input_tokens_info = []
+        output_tokens_info = []
+        for input_line_id, input_line in enumerate(input_lines):
+            for char in input_line:
+                input_tokens_info.append(LCSTokenInfo(
+                    char,
+                    1,
+                    input_line_id,
+                    ))
+        
+        for output_line_id, output_line in enumerate(output_lines):
+            for char in output_line:
+                if char in char_set: # 为子序列写的优化
+                    output_tokens_info.append(LCSTokenInfo(
+                        char,
+                        1,
+                        output_line_id,
+                        ))
+        return input_tokens_info, output_tokens_info
+
+def lcs_sequence_alignment(input_lines: list[str] , output_lines: list[str], drop_th=0.6, tokenizer=tokenize_by_space_splited_word) -> Tuple[dict[int, Tuple[int, int]], list[float], list[float]]:
+    """
+    将input_lines每行的单词用最长公共子序列对齐到output_lines每行的单词中。
+    这个函数同时还会计算每行输入输出的单词命中率（此行的已匹配单词总长度/此行单词总长度）。
     
     Args:
-        ibatch(str): 输入的一段话
-        obatch(str): chatgpt给对齐好的一段话
+        input_lines(str): 输入的一段话
+        output_lines(str): chatgpt给对齐好的一段话
     
     Returns:
-        mapping(dict[int, set[int]]): 输出行号对应输入的行号
-        irate(list[float]): 输入每行的匹配率（匹配的单词总长度/本行总单词总长度）
-        orate(list[float]): 输出每行的匹配率
+        align_map(dict[int, set[int]]): 输出行号对应输入的行号
+        input_hit_rate(list[float]): 输入每行的匹配率（匹配的单词总长度/本行总单词总长度）
+        output_hit_rate(list[float]): 输出每行的匹配率
+
+    Example:
+        输入:
+            行号    input_lines
+            0       1. it's a beautiful
+            1       day outside.
+            2       2. birds are singing,
+            3       flowers are
+            4       blooming...
+            5       3. on days like these,
+            6       kids like you...
+            7       4. Should
+            8       be
+            9       burning
+            10      in hell.
+
+            行号    output_lines
+            0       1. it's a beautiful day outside.
+            1       2. birds are singing, flowers are blooming...
+            2       3. on days like these, kids like you...
+            3       4. Should be burning in hell.
+
+        输出:
+            align_map: {0: {0, 1}, 1: {2, 3, 4}, 2: {5, 6}, 3: {7, 8, 9, 10}}
+            input_hit_rate: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0] (全部命中)
+            output_hit_rate: [1.0, 1.0, 1.0, 1.0] (全部命中)
+
     """
-    if isinstance(ibatch, str):
-        ibatch = ibatch.splitlines()
-    if isinstance(obatch, str):
-        obatch = obatch.splitlines()
-    offset = 19968
-    dic = {}
-    
-    ibuf = [] # 输入token
-    ilen = []
+    if isinstance(input_lines, str):
+        input_lines = input_lines.splitlines()
+    if isinstance(output_lines, str):
+        output_lines = output_lines.splitlines()
+    # 考虑到运行效率，我们切分粒度采用空格隔开的单词而不是字母
+    input_tokens_info, output_tokens_info = tokenizer(input_lines, output_lines)
 
-    obuf = []
-    olen = []
-    # 手写的token转换，优化lcs的效率，这里换成中文字形式编码这些token，只判等
-    offset = 19968 # 中文unicode起点
-    dic = {}
-    for ilineid, iline in enumerate(ibatch):
-        sp = iline.split()
-        ilen.append(sum(map(len, sp)))
-        for i in sp:
-            ibuf.append((
-                chr(offset + dic.setdefault(i, len(dic))),
-                len(i),
-                ilineid,
-                ))
-    
-    for olineid, oline in enumerate(obatch):
-        sp = oline.split()
-        olen.append(sum(map(len, sp)))
-        for i in oline.split():
-            if i in dic: # 为子序列写的优化
-                obuf.append((
-                    chr(offset + dic[i]),
-                    len(i),
-                    olineid,
-                    ))
-    
+    # 算输入输出的每行的单词命中率，即：匹配的单词总字符数 / 单词总字符数
+    input_hit_rate = [0 for _ in input_lines] 
+    output_hit_rate = [0 for _ in output_lines]
 
-    irate = [0 for _ in ilen]
-    orate = [0 for _ in olen]
+    input_tokens = ''.join(map(lambda x: x[0], input_tokens_info))
+    output_tokens = ''.join(map(lambda x: x[0], output_tokens_info))
+    aligned_indexes = pylcs.lcs_sequence_idx(input_tokens, output_tokens) # 输入的每个单词的下标对应于输出的每个单词下标，不为-1失配的情况下保证是递增的
+    align_map = {}
+    for input_token_index, output_token_index in enumerate(aligned_indexes):
+        if output_token_index != -1:
+            _, input_word_length, input_lineid = input_tokens_info[input_token_index]
+            _, output_word_length, output_lineid = output_tokens_info[output_token_index]
+            # 每个output_lineid对应一段input_lineid的区间，是一个2元素的列表[l, r]，代表本段包含了源文本中行号区间为[l, r]之间的行
+            align_map.setdefault(output_lineid, [input_lineid, input_lineid])[1] = input_lineid # 左区间(即[0])用setdefault填入，右区间由[1] = input_lineid更新
+            input_hit_rate[input_lineid] += input_word_length
+            output_hit_rate[output_lineid] += output_word_length
 
-    n1 = ''.join(map(lambda x: x[0], ibuf))
-    n2 = ''.join(map(lambda x: x[0], obuf))
-    print(f'n1:{len(n1)}, n2:{len(n2)}')
-    idxs = pylcs.lcs_sequence_idx(n1, n2)
-    mapping = {}
-    for iidx, oidx in enumerate(idxs):
-        if oidx != -1:
-            _, iklen, ikgroup = ibuf[iidx]
-            _, oklen, okgroup = obuf[oidx]
-            mapping.setdefault(okgroup, set()).add(ikgroup)
-            irate[ikgroup] += iklen
-            orate[okgroup] += oklen
-    
-    for p, i in enumerate(irate):
-        irate[p] = i / ilen[p]
-    for p, i in enumerate(orate):
-        orate[p] = i / olen[p]
+    for p, _ in enumerate(input_hit_rate):
+        input_hit_rate[p] /= sum(map(len, input_lines[p].split())) + 1e-3
+    for p, _ in enumerate(output_hit_rate):
+        output_hit_rate[p] /= sum(map(len, output_lines[p].split())) + 1e-3
 
     # 额外处理：匹配率低于60%的olineid不要
-    print(mapping)
-    print('orate', orate)
-    for p, i in enumerate(orate):
+    print(align_map)
+    print('orate', output_hit_rate)
+    for p, i in enumerate(output_hit_rate):
         if i < drop_th:
-            if p in mapping:
-                mapping.pop(p)
-
-    return mapping, irate, orate
+            if p in align_map:
+                align_map.pop(p)
+    
+    return align_map, input_hit_rate, output_hit_rate
 
 def get_br_indexes_from_alignmap(align_map: dict[int, set[int]]) -> list[int]:
     br = []
@@ -523,19 +581,24 @@ def translate_and_align():
     ###UNDER CONSTRUCTION###
     ########################
     """
+    use_proxy()
     from transformers import pipeline
-    tr = pipeline("translation", model=f"Helsinki-NLP/opus-mt-zh-en", device='cuda:0')
+    # tr = pipeline("translation", model=f"Helsinki-NLP/opus-mt-zh-en", device='cuda:0')
+    tr = pipeline("translation", model=f"Helsinki-NLP/opus-mt-en-zh", device='cuda:0')
 
-    hm = datasets.load_dataset('bot-yaya/human_joined_en_paragraph_19', split='train')
+    hm = datasets.load_dataset('bot-yaya/human_joined_en_paragraph_19', split='train').filter(lambda x: x['record'] != '515053')
     recs = {x['record'] for x in hm}
 
+    ALIGN_LOG_FILE_NAME = my_path('aligned.txt')
+    if os.path.exists(ALIGN_LOG_FILE_NAME):
+        os.remove(ALIGN_LOG_FILE_NAME)
 
-    def trans(row):
-        z = row['zh']
-        tr_e = []
-        for zl in z.splitlines():
-            tr_e.append(tr(zl)[0]['translation_text'].lower())
-        
+    DISCARD_LOG_FILE_NAME = my_path('discard.txt')
+    if os.path.exists(DISCARD_LOG_FILE_NAME):
+        os.remove(DISCARD_LOG_FILE_NAME)
+
+    def translate(row):
+        translated = []
         br_rev = hm.filter(lambda x: x['record'] == row['record'])[0]['is_hard_linebreak']
 
         buf = []
@@ -546,17 +609,63 @@ def translate_and_align():
                 buf.append(i)
             else:
                 buf[-1] += ' ' + i
+
+        for en_para in buf:
+            tmp = []
+            translated.append('')
+            for word in en_para.split():
+                tmp.append(word)
+                if len(tmp) >= 350 or sum(map(len, tmp)) >= 1024:
+                    translated[-1] += ''.join(tr(' '.join(tmp))[0]['translation_text'])
+                    tmp.clear()
+            if tmp:
+                translated[-1] += ''.join(tr(' '.join(tmp))[0]['translation_text'])
+        row['buf'] = buf
+        row['translated_en_zh'] = translated
+        return row
+
+    def align(row):
+        buf = row['buf']
+        z = row['zh']
+        zls = z.splitlines()
             
-        align_map, irate, orate = lcs_sequence_alignment(tr_e, buf, 0.4)
+        align_map, irate, orate = lcs_sequence_alignment(zls, row['translated_en_zh'], 0.2, tokenize_by_char)
         print(align_map)
         print(irate)
         print(orate)
 
-    (
+        with open(ALIGN_LOG_FILE_NAME, 'a', encoding='utf-8') as f:
+            f.write(make_banner(row['record']) + '\n')
+        
+        with open(DISCARD_LOG_FILE_NAME, 'a', encoding='utf-8') as f:
+            f.write(make_banner(row['record']) + '\n')
+
+
+        for o, (il, ir) in align_map.items():
+            zh_para = ''.join(zls[il:ir + 1])
+            en_para = buf[o]
+            print(zh_para)
+            print(en_para)
+            print()
+            print('================')
+            print()
+            with open(ALIGN_LOG_FILE_NAME, 'a', encoding='utf-8') as f:
+                f.write(zh_para + '\n')
+                f.write(en_para + '\n')
+                f.write('\n')
+                f.write('================\n')
+                f.write('\n')
+
+        for oid, o in enumerate(buf):
+            if oid not in align_map:
+                with open(DISCARD_LOG_FILE_NAME, 'a', encoding='utf-8') as f:
+                    f.write(o + '\n')
+    translated_dataset = (
         datasets.load_dataset('bot-yaya/UN_PDF_SUBSET_PREPROCESSED', split='train')
         .filter(lambda x: x['record'] in recs)
-        .map(trans)
+        .map(translate)
     )
+    translated_dataset.map(align)
 
 def preprocess_and_upload_dataset():
     from collections import Counter
@@ -567,7 +676,9 @@ def preprocess_and_upload_dataset():
     DIGITS_PATTERN = re.compile('^\d+$')
     MATCHER_RATIO = 0.72
     FILTER_LOG = 'preprocessed_log.jsonl'
-    Path(PREPROCESS_DIR).mkdir(exist_ok=True)
+    Path(my_path(PREPROCESS_DIR)).mkdir(exist_ok=True)
+    if os.path.exists(my_path(FILTER_LOG)):
+        os.remove(my_path(FILTER_LOG))
 
     def make_filter_log(filtered: str, record: str | int, lang: str, page: str | int, reason: str):
         """将过滤的内容写到log里方便分析"""
@@ -755,6 +866,7 @@ def preprocess_and_upload_dataset():
     dataset = dataset.filter(chk_en_rate).map(preprocess, num_proc=8)
     dataset.map(dump_row)
     dataset.save_to_disk(my_path())
+    # dataset = datasets.load_from_disk(my_path())
     print(len(dataset))
     dataset.push_to_hub('bot-yaya/un_pdf_random10032_preprocessed2', token=read_secret('HF_TOKEN'))
 
@@ -794,4 +906,6 @@ if __name__ == "__main__":
 >>>''')
     ) not in command_map:
         print('invalid input')
+    begintime = datetime.datetime.now()
     command_map[cmd]()
+    print('Time elapsed:', datetime.datetime.now() - begintime)
